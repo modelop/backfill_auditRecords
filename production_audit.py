@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Preflight Checks for StoredModel AuditRecords Backfill
+StoredModel AuditRecords
 
-This script conducts a preflight check before running the actual backfill process:
+This script retrieves all audit records associated with Production use cases:
 
 Step 1: Load Configuration
     - Establish authenticated session to ModelOp Center
@@ -11,50 +11,30 @@ Step 2: Discover Production StoredModels
     - GET /api/storedModels/search/findProductionUseCases
     - Capture all StoredModels currently in production
 
-Step 3: Resolve MLC Workflow History
-    - For each StoredModel from Step 2:
-        GET /api/modelMLCs/search/findAllByStoredModelIdAndGroupIn
-    - Capture process execution history
-
-Step 4: Capture Current AuditRecords State
+Step 3: Capture Current AuditRecords State
     - For each StoredModel:
         GET /model-manage/api/auditRecords?storedModelId={id}
-    - Capture the CURRENT state of audit records BEFORE any backfill operations
-    - This allows comparison of before/after results
 
 Output CSVs:
-    - preflight_storedmodels.csv        (production StoredModels snapshot)
-    - preflight_mlcs.csv                (modelMLC workflow history)
-    - preflight_auditrecords_before.csv (current AuditRecords state BEFORE backfill)
-
-These CSVs can be compared against the post-backfill state to verify the operations.
+    - storedmodels.csv          (production StoredModels snapshot)
+    - auditrecords.csv          (AuditRecords generated after model entered production)
 """
 
 import json
 import logging
-import os
-import re
-import time
 from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
-from dotenv import load_dotenv
-
 
 # ==========================================
 # CONFIGURATION & AUTHENTICATION
 # ==========================================
 
-load_dotenv(override=False)
-
 # TODO: Add base url and access token
 # Retrieve configuration from environment or prompt user
 MOC_BASE_URL = "your-base-url".strip() 
 MOC_ACCESS_TOKEN = "your-access-token".strip()
-
-MOC_ACCESS_TOKEN_TIMESTAMP = os.getenv("MOC_ACCESS_TOKEN_TIMESTAMP", "0").strip()
-MOC_TOKEN_REFRESH_INTERVAL_MINUTES = int(os.getenv("MOC_TOKEN_REFRESH_INTERVAL_MINUTES", "30"))
 
 # TODO: Add production stage value
 # Production model stage value, from SCCS configuration (Step 1 in doc):
@@ -71,21 +51,15 @@ HTTP_TIMEOUT = 30
 PAGE_SIZE = 200
 
 # Output CSV paths
-PREFLIGHT_STOREDMODELS_CSV = "preflight_storedmodels.csv"
-PREFLIGHT_MLCS_CSV = "preflight_mlcs.csv"
-PREFLIGHT_AUDITRECORDS_CSV = "preflight_auditrecords_before.csv"
+PREFLIGHT_STOREDMODELS_CSV = "storedmodels.csv"
+PREFLIGHT_AUDITRECORDS_CSV = "auditrecords.csv"
 
 # Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
-logger = logging.getLogger("preflight_audit_check")
-
-
-# ==========================================
-# AUTHENTICATION & ENV FILE MANAGEMENT
-# ==========================================
+logger = logging.getLogger("production_use_case_audit_check")
 
 def normalize_access_token(raw_token: str) -> str:
     """Normalize access token (handle both raw string and JSON formats)."""
@@ -162,62 +136,13 @@ def discover_production_storedmodels(base_url: str, session: requests.Session) -
     logger.info("Discovered %d production StoredModels.", len(stored_models))
     return stored_models
 
-
 # ==========================================
-# STEP 3: RESOLVE MLC WORKFLOW HISTORY
-# ==========================================
-
-def fetch_model_mlcs_for_stored_model(
-    base_url: str, session: requests.Session, stored_model_id: str, group: str
-) -> List[Dict]:
-    """
-    Step 3: For each StoredModel, call GET /api/modelMLCs/search/findAllByStoredModelId
-    to retrieve workflow execution history.
-    """
-    logger.debug("Fetching modelMLCs for StoredModel id=%s group=%s...", stored_model_id, group)
-
-    mlcs: List[Dict] = []
-    page = 0
-
-    while True:
-        url = f"{base_url}/model-manage/api/modelMLCs/search/findAllByStoredModelIdAndGroupIn"
-        params = {
-            "storedModelId": stored_model_id,
-            "group": group,
-            "page": page,
-            "size": PAGE_SIZE,
-        }
-
-        resp = session.get(url, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        body = resp.json()
-        batch = body.get("_embedded", {}).get("modelMLCs", [])
-
-        if not batch:
-            logger.debug("No more MLCs in this page.")
-            break
-
-        mlcs.extend(batch)
-
-        page_info = body.get("page", {})
-        total_pages = page_info.get("totalPages")
-        if total_pages is not None and page >= total_pages - 1:
-            logger.debug("Reached last page of MLCs.")
-            break
-
-        page += 1
-
-    logger.debug("Found %d modelMLC entries for StoredModel id=%s.", len(mlcs), stored_model_id)
-    return mlcs
-
-
-# ==========================================
-# STEP 4: CAPTURE CURRENT AUDITRECORDS STATE
+# STEP 3: CAPTURE CURRENT AUDITRECORDS STATE
 # ==========================================
 
 def fetch_existing_audit_records(base_url: str, session: requests.Session, stored_model_id: str) -> List[Dict]:
     """
-    Step 4: For each StoredModel, call GET /model-manage/api/auditRecords
+    Step 3: For each StoredModel, call GET /model-manage/api/auditRecords
     to capture the CURRENT state of audit records BEFORE any backfill operations.
     """
     logger.debug("Fetching existing AuditRecords for StoredModel id=%s...", stored_model_id)
@@ -284,45 +209,6 @@ def process_and_export_storedmodels(stored_models: List[Dict], csv_path: str) ->
     df.to_csv(csv_path, index=False)
     logger.info("Exported %d StoredModels to %s", len(df), csv_path)
     return df
-
-
-def process_and_export_mlcs(
-    stored_models: List[Dict], base_url: str, session: requests.Session, csv_path: str
-) -> pd.DataFrame:
-    """Process MLC data and export to CSV."""
-    logger.info("Processing MLC workflow history...")
-    rows: List[Dict] = []
-
-    for sm in stored_models:
-        sm_id = sm.get("id")
-        sm_group = sm.get("group", "UNKNOWN_GROUP")
-        meta = sm.get("modelMetaData", {}) or {}
-        sm_name = meta.get("name", sm_id)
-
-        mlcs = fetch_model_mlcs_for_stored_model(base_url, session, sm_id, sm_group) # type: ignore
-
-        for mlc in mlcs:
-            proc = mlc.get("processInstance", {}) or {}
-            rows.append(
-                {
-                    "storedModelId": sm_id,
-                    "storedModelName": sm_name,
-                    "group": sm_group,
-                    "mlcId": mlc.get("id"),
-                    "processDefinitionKey": proc.get("processDefinitionKey"),
-                    "processDefinitionName": proc.get("processDefinitionName"),
-                    "processStartTime": proc.get("startTime"),
-                    "processEndTime": proc.get("endTime"),
-                    "processDurationMs": proc.get("durationInMillis"),
-                    "processState": proc.get("state"),
-                }
-            )
-
-    df = pd.DataFrame(rows)
-    df.to_csv(csv_path, index=False)
-    logger.info("Exported %d MLC entries to %s", len(df), csv_path)
-    return df
-
 
 def process_and_export_auditrecords(
     stored_models: List[Dict], base_url: str, session: requests.Session, csv_path: str
@@ -395,18 +281,16 @@ def main() -> None:
     --------
     1. Authenticate to MOC 3.4 
     2. Discover production StoredModels and export to csv
-    3. Fetch MLC workflow history for each StoredModel and export to csv
-    4. Capture current AuditRecords state BEFORE any modifications and export to csv
+    3. Capture current AuditRecords and export to csv
 
     Output Files:
     --------
-    - preflight_storedmodels.csv:        Production StoredModels snapshot
-    - preflight_mlcs.csv:                MLC workflow execution history
-    - preflight_auditrecords_before.csv: Current AuditRecords state BEFORE backfill
+    - storedmodels.csv:        Production StoredModels snapshot
+    - auditrecords_before.csv: Current AuditRecords state BEFORE backfill
     """
     global MOC_ACCESS_TOKEN
 
-    # Create authenticated session
+    # Step 1: Create authenticated session
     logger.info("Creating authenticated session to %s...", MOC_BASE_URL)
     session = create_authenticated_session(MOC_BASE_URL, MOC_ACCESS_TOKEN)
 
@@ -419,10 +303,7 @@ def main() -> None:
     # Export StoredModels
     df_storedmodels = process_and_export_storedmodels(stored_models, PREFLIGHT_STOREDMODELS_CSV)
 
-    # Step 3: Fetch MLC workflow history
-    df_mlcs = process_and_export_mlcs(stored_models, MOC_BASE_URL, session, PREFLIGHT_MLCS_CSV)
-
-    # Step 4: Capture current AuditRecords state
+    # Step 3: Capture current AuditRecords state
     df_auditrecords = process_and_export_auditrecords(stored_models, MOC_BASE_URL, session, PREFLIGHT_AUDITRECORDS_CSV)
 
     # Summary
@@ -431,15 +312,8 @@ def main() -> None:
     logger.info("=" * 80)
     logger.info("Exported files:")
     logger.info("  1. %s (%d StoredModels)", PREFLIGHT_STOREDMODELS_CSV, len(df_storedmodels))
-    logger.info("  2. %s (%d MLC entries)", PREFLIGHT_MLCS_CSV, len(df_mlcs))
-    logger.info("  3. %s (%d AuditRecord entries BEFORE backfill)", PREFLIGHT_AUDITRECORDS_CSV, len(df_auditrecords))
+    logger.info("  2. %s (%d AuditRecord entries BEFORE backfill)", PREFLIGHT_AUDITRECORDS_CSV, len(df_auditrecords))
     logger.info("=" * 80)
-    logger.info("Next steps:")
-    logger.info("  1. Review the exported CSV files to understand current state")
-    logger.info("  2. Run: python backfill_storedModel_auditRecords.py")
-    logger.info("  3. Compare preflight_auditrecords_before.csv with auditrecord_backfill_results.csv")
-    logger.info("=" * 80)
-
 
 if __name__ == "__main__":
     main()

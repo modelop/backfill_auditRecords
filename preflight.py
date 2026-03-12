@@ -5,7 +5,6 @@ Preflight Checks for StoredModel AuditRecords Backfill
 This script conducts a preflight check before running the actual backfill process:
 
 Step 1: Load Configuration
-    - Read authentication credentials
     - Establish authenticated session to ModelOp Center
 
 Step 2: Discover Production StoredModels
@@ -66,9 +65,6 @@ MOC_TOKEN_REFRESH_INTERVAL_MINUTES = int(os.getenv("MOC_TOKEN_REFRESH_INTERVAL_M
 # NOTE: value is case-sensitive and MUST match your environment.
 PRODUCTION_MODEL_STAGE_VALUE = "Production" 
 
-# Get path to .env file
-ENV_FILE_PATH = os.path.join(os.path.dirname(__file__), ".env")
-
 # HTTP Configuration
 VERIFY_SSL = True
 HTTP_TIMEOUT = 30
@@ -90,91 +86,6 @@ logger = logging.getLogger("preflight_audit_check")
 # ==========================================
 # AUTHENTICATION & ENV FILE MANAGEMENT
 # ==========================================
-
-def authenticate_and_get_token(base_url: str, username: str, password: str) -> str:
-    """Authenticate and retrieve OAuth2 token from /gocli/token endpoint."""
-    token_url = f"{base_url}/gocli/token"
-    payload = {"username": username, "password": password}
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
-    logger.info("Authenticating to ModelOp Center at %s...", base_url)
-    try:
-        response = requests.post(token_url, data=payload, headers=headers, timeout=HTTP_TIMEOUT, verify=VERIFY_SSL)
-        response.raise_for_status()
-
-        access_token = response.text.strip()
-        logger.debug("Received token from authentication endpoint.")
-
-        # Handle JSON response if applicable
-        if "{" in access_token:
-            try:
-                token_data = json.loads(access_token)
-                access_token = token_data.get("access_token", access_token)
-            except json.JSONDecodeError:
-                pass
-
-        if not access_token:
-            raise ValueError("Could not extract access token from authentication response.")
-
-        logger.info("Successfully authenticated to ModelOp Center.")
-        return access_token
-    except requests.RequestException as exc:
-        logger.error("Authentication failed: %s", exc)
-        raise
-
-
-def save_token_to_env(access_token: str, env_file: str = ENV_FILE_PATH) -> None:
-    """Save access token and current timestamp to .env file."""
-    current_timestamp = str(int(time.time()))
-    
-    try:
-        # Read existing .env file
-        if os.path.exists(env_file):
-            with open(env_file, "r") as f:
-                content = f.read()
-        else:
-            content = ""
-        
-        # Update or add MOC_ACCESS_TOKEN
-        if "MOC_ACCESS_TOKEN=" in content:
-            content = re.sub(r'MOC_ACCESS_TOKEN=.*', f'MOC_ACCESS_TOKEN={access_token}', content)
-        else:
-            content += f"\nMOC_ACCESS_TOKEN={access_token}"
-        
-        # Update or add MOC_ACCESS_TOKEN_TIMESTAMP
-        if "MOC_ACCESS_TOKEN_TIMESTAMP=" in content:
-            content = re.sub(r'MOC_ACCESS_TOKEN_TIMESTAMP=.*', f'MOC_ACCESS_TOKEN_TIMESTAMP={current_timestamp}', content)
-        else:
-            content += f"\nMOC_ACCESS_TOKEN_TIMESTAMP={current_timestamp}"
-        
-        # Write back to .env file
-        with open(env_file, "w") as f:
-            f.write(content)
-        
-        logger.info("Token and timestamp saved to %s", env_file)
-    except Exception as exc:
-        logger.error("Failed to save token to .env file: %s", exc)
-
-
-def is_token_stale(token_timestamp_str: str, refresh_interval_minutes: int = MOC_TOKEN_REFRESH_INTERVAL_MINUTES) -> bool:
-    """Check if token is stale (older than refresh_interval_minutes)."""
-    try:
-        token_timestamp = int(token_timestamp_str)
-        current_timestamp = int(time.time())
-        age_seconds = current_timestamp - token_timestamp
-        age_minutes = age_seconds / 60
-        
-        is_stale = age_minutes > refresh_interval_minutes
-        if is_stale:
-            logger.info("Token is stale (%.1f minutes old, refresh interval: %d minutes).", age_minutes, refresh_interval_minutes)
-        else:
-            logger.info("Token is fresh (%.1f minutes old).", age_minutes)
-        
-        return is_stale
-    except (ValueError, TypeError) as exc:
-        logger.warning("Could not parse token timestamp '%s': %s. Treating as stale.", token_timestamp_str, exc)
-        return True
-
 
 def normalize_access_token(raw_token: str) -> str:
     """Normalize access token (handle both raw string and JSON formats)."""
@@ -482,11 +393,10 @@ def main() -> None:
 
     Process:
     --------
-    1. Authenticate to MOC 3.4 (with token refresh if stale)
-    2. Discover production StoredModels
-    3. Fetch MLC workflow history for each StoredModel
-    4. Capture current AuditRecords state BEFORE any modifications
-    5. Export all data to CSV files for comparison after backfill
+    1. Authenticate to MOC 3.4 
+    2. Discover production StoredModels and export to csv
+    3. Fetch MLC workflow history for each StoredModel and export to csv
+    4. Capture current AuditRecords state BEFORE any modifications and export to csv
 
     Output Files:
     --------

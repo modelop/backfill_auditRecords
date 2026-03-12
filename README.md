@@ -1,17 +1,16 @@
 # ModelOp AuditRecords Backfill Solution
 
-### ***Secure, validated approach to retroactively assign production dates to StoredModel audit records before the 3.4 upgrade.***
+### ***Secure, validated approach to retroactively assign production dates to StoredModel audit records after the 3.4 upgrade.***
 
 ---
 
 ## Overview
 
-This is a production-ready Python solution for backfilling StoredModel AuditRecords, model stages, and model business drivers in ModelOp Center 3.4, implementing the process documented in the ModelOp engineering guide: [Backfilling StoredModel AuditRecords Before ModelOp Center 3.4 Upgrade](https://modelop.atlassian.net/wiki/x/BIBbvQ) (requires access permission).
+This is a production-ready Python solution for backfilling StoredModel AuditRecords, model stages, and model business drivers in ModelOp Center 3.4.
 
 ### The Problem
 
-When upgrading to ModelOp Center 3.4, AuditRecords for StoredModels that were promoted to production *before* the upgrade don't exist. Without these records, your governance dashboard and audit trails are incomplete for those models.  Additionally, any StoredModel records that do not have values set for modelStage and primaryDriver will not appear on the Use Case
-dashboard which leads to number mismatches.
+When upgrading to ModelOp Center 3.4, AuditRecords for StoredModels that were promoted to production *before* the upgrade don't exist. Without these records, your governance dashboard and audit trails are incomplete for those models.  Additionally, any StoredModel records that do not have values set for modelStage and primaryDriver will not appear on the Use Case dashboard which results in misleading charts and counts.
 
 ### The Solution
 
@@ -31,24 +30,24 @@ This toolkit provides:
 
 ```mermaid
 flowchart TD
-    A[".env Credentials"] -->|Load| B["preflight.py"]
+    A -->|Load| B["preflight.py"]
     A -->|Load| C["backfill_storedModel_auditRecords.py"]
     
-    B -->|GET storedModels| D["Step 2: Discover Production StoredModels"]
-    D -->|GET modelMLCs| E["Step 3: Fetch MLC Workflow History"]
-    E -->|Get endTime| F["Step 4: Capture Current AuditRecords State"]
+    B -->|GET storedModels| D["Step 1: Discover Production StoredModels"]
+    D -->|GET modelMLCs| E["Step 2: Fetch MLC Workflow History"]
+    E -->|Get endTime| F["Step 3: Capture Current AuditRecords State"]
     
     F -->|Export| G["preflight CSVs"]
     
     G -->|Review & Approve| H{Decision Point}
     
     H -->|Proceed| C
-    C -->|GET storedModels| I["Step 2: Discover Production StoredModels"]
-    I -->|GET modelMLCs| J["Step 3: Resolve Production Dates"]
+    C -->|GET storedModels| I["Step 1: Discover Production StoredModels"]
+    I -->|GET modelMLCs| J["Step 2: Resolve Production Dates"]
     J -->|Calculate endTime| K["Identify Historical Production Date"]
     
-    K -->|POST auditRecords| L["Step 4a: Create New AuditRecord"]
-    L -->|PATCH createdDate| M["Step 4b: Set Historical Date"]
+    K -->|POST auditRecords| L["Step 3a: Create New AuditRecord"]
+    L -->|PATCH createdDate| M["Step 3b: Set Historical Date"]
     
     M -->|Export| N["backfill CSVs"]
     
@@ -62,10 +61,6 @@ flowchart TD
 
 ```
 backfill_auditRecords/
-├── .env                                      # Credentials (git-ignored)
-├── .gitignore                                # Protects secrets & outputs
-├── .vscode/
-│   └── settings.json                         # VS Code terminal .env auto-loading
 ├── requirements.txt                          # Python dependencies
 │
 ├── preflight.py                              # Step 1-4: Non-destructive preflight
@@ -92,32 +87,12 @@ backfill_auditRecords/
 
 ### Environment Variables
 
-The system uses a `.env` file (automatically created on first run) to store:
-
 ```plaintext
 MOC_BASE_URL=https://your-instance.modelop.center
 MOC_ACCESS_TOKEN=<cached-oauth2-token>
 PRODUCTION_MODEL_STAGE_VALUE=prod
 ```
 
-**Security**: 
-- `.env` is protected by `.gitignore` and never committed to version control
-- Credentials are read from the file and cached to avoid repeated authentication
-- Access tokens are stored locally for reuse across script runs
-
-### VS Code Terminal Configuration
-
-The `.vscode/settings.json` file in the workspace is pre-configured to automatically load `.env` variables in the integrated terminal:
-
-```json
-{
-  "python.terminal.useEnvFile": true,
-  "python.terminal.executeInFileDir": true,
-  "[python]": {
-    "editor.formatOnSave": true,
-    "editor.defaultFormatter": "ms-python.python"
-  }
-}
 ```
 
 **Verification**: Open VS Code terminal and run `echo $MOC_BASE_URL` — it should print your configured URL.
@@ -137,29 +112,11 @@ This installs:
 - **pandas** ≥ 1.5.0 — DataFrame and CSV handling
 - **python-dotenv** ≥ 0.21.0 — Environment variable management
 
-### 2. Verify VS Code Configuration
-
-Check that `.vscode/settings.json` exists and contains `"python.terminal.useEnvFile": true`
-
-```bash
-# Windows
-type .vscode\settings.json
-
-# Mac/Linux
-cat .vscode/settings.json
-```
-
-### 3. First Run Setup
+### First Run Setup
 
 ```bash
 python preflight.py
 ```
-
-On first run, the script will prompt for:
-- ModelOp Center base URL
-- Bearer token
-
-These credentials will be saved to `.env` for future runs and cached token for reuse.
 
 ---
 
@@ -218,8 +175,9 @@ python backfill_storedModel_auditRecords.py
 ```
 
 **What it does**:
-- Authenticates using `.env` credentials (or cached token)
-- Discovers production StoredModels
+- Authenticates to ModelOp Center
+- Discovers StoredModels
+- **Updates unset primaryDriver and modelStage** on each Use Case
 - **Resolves historical production dates** from MLC workflow `processInstance.endTime` values
 - **Creates new AuditRecords** via `POST /model-manage/api/auditRecords` ⚠️ **DESTRUCTIVE**
 - **Patches createdDate** via `PATCH /model-manage/api/auditRecords/{id}` to set historical dates ⚠️ **DESTRUCTIVE**
@@ -271,31 +229,19 @@ diff -u preflight_auditrecords_before.csv auditrecord_backfill_results.csv
 
 ### Authentication Issues
 
-**Error**: `ModuleNotFoundError: No module named 'dotenv'`
-```bash
-pip install python-dotenv
-```
 
 **Error**: `401 Unauthorized` or `Failed to authenticate`
 ```bash
-# Delete cached credentials and re-authenticate
-rm .env    # (Windows: del .env)
+# Check your bearer token/access token and environment URL
 python preflight.py
 # Enter credentials when prompted
 ```
-
-**Error**: Credentials prompt appears every run
-- Verify `.env` file was created: `ls -la .env` (or `dir .env` on Windows)
-- Verify `python.terminal.useEnvFile` is enabled in `.vscode/settings.json`
-- Close and reopen the integrated terminal (`Ctrl + Shift + Backtick`)
-
----
 
 ### API Connection Issues
 
 **Error**: `Connection timeout` or `HTTPConnectionPool`
 - Verify network connectivity to ModelOp Center instance
-- Check base URL is correct in `.env`
+- Check base URL is correct
 - Verify firewall/proxy settings aren't blocking API calls
 - Test connectivity: `ping your-instance.modelop.center`
 
@@ -310,7 +256,7 @@ python preflight.py
 
 **Error**: `No production StoredModels discovered`
 - Verify StoredModels exist and are in production stage
-- Check `PRODUCTION_MODEL_STAGE_VALUE` configuration in `.env` (default: `prod`)
+- Check `PRODUCTION_MODEL_STAGE_VALUE` (default: `prod`)
 - Run preflight with debug logging for details
 
 **Error**: `preflight_mlcs.csv is empty`
@@ -320,8 +266,6 @@ python preflight.py
 
 **Error**: CSV files are empty or minimal
 - Check script logs for error messages
-- Verify authentication succeeds (check `.env` file)
-- Re-run preflight with fresh credentials: `del .env && python preflight.py`
 
 ---
 
@@ -390,30 +334,15 @@ python preflight.py
 - `newAuditRecordId` — Newly created AuditRecord UUID
 - `newAuditRecordCreatedDate` — Creation date (set to resolvedProductionDate)
 
-### Environment Variables (in .env)
-
-| Variable | Example | Purpose |
-|----------|---------|---------|
-| `MOC_BASE_URL` | `https://instance.modelop.center` | ModelOp Center base URL |
-| `USERNAME` | `user@company.com` | Credentials for API authentication |
-| `PASSWORD` | `your_password` | Credentials for API authentication |
-| `MOC_ACCESS_TOKEN` | `eyJraWQiOi...` | Cached OAuth2 token (auto-managed) |
-| `PRODUCTION_MODEL_STAGE_VALUE` | `prod` | Model stage value to filter on |
-
 ---
 
 ## Security Best Practices
 
 ✅ **Implemented in this toolkit**:
-- `.env` file is protected by `.gitignore`
-- Credentials never logged to console
 - OAuth2 token cached locally for reuse
 - HTTPS for all API calls
-- Clear separation of secrets from code
 
 ⚠️ **Additional recommendations**:
-- Set `.env` file permissions: `chmod 600 .env` (Unix-like systems)
-- Never commit `.env` to version control
 - Use service accounts for automated deployments
 - Rotate credentials periodically
 - Consider AWS Secrets Manager or HashiCorp Vault for production environments
@@ -441,38 +370,6 @@ python preflight.py
 2. Check the detailed logs (enable DEBUG logging above)
 3. Verify API endpoints are accessible and correct
 4. Ensure your credentials are valid
-5. Review the [engineering guide](https://modelop.atlassian.net/wiki/x/BIBbvQ) for process details
-
----
-
-## Workflow Scenarios
-
-### Scenario A: Single-Day Backfill
-
-```
-Morning:   python preflight.py           # Review current state
-Afternoon: python backfill_*.py          # Execute backfill
-Evening:   Compare CSV files             # Verify results
-```
-
-### Scenario B: Phase-Gate Approval
-
-```
-Day 1:  python preflight.py          # Capture state, share results
-Day 2:  Review & stakeholder approval
-Day 3:  python backfill_*.py         # Execute backfill after approval
-        Compare results
-```
-
-### Scenario C: Phased Rollout
-
-```
-Week 1: Run preflight on subset of models
-Day 3:  Backfill first batch
-Day 7:  Validate, then run preflight/backfill on remaining models
-```
-
----
 
 ## Implementation Details
 
@@ -481,21 +378,14 @@ Day 7:  Validate, then run preflight/backfill on remaining models
 For each production StoredModel:
 
 1. **Discovers** via `GET /api/storedModels/search/findProductionUseCases`
-2. **Resolves production date** from `GET /api/modelMLCs` → takes latest `processInstance.endTime`
-3. **Creates AuditRecord** via `POST /model-manage/api/auditRecords`
-4. **Patches createdDate** via `PATCH /model-manage/api/auditRecords/{id}` to historical date
-
-### Authentication Flow
-
-1. First run: Prompts for username/password
-2. Calls `POST /gocli/token` with credentials
-3. Receives OAuth2 access token
-4. **Saves token to `.env` for future runs** (avoiding repeated prompts)
-5. Subsequent runs use cached token automatically
+2. **Updates** empty modelStage and primaryDriver values to 'unassigned'
+3. **Resolves production date** from `GET /api/modelMLCs` → takes latest `processInstance.endTime`
+4. **Creates AuditRecord** via `POST /model-manage/api/auditRecords`
+   **Patches createdDate** via `PATCH /model-manage/api/auditRecords/{id}` to historical date
 
 ### Fallback Logic
 
-- If no MLC workflows found, uses `StoredModel.createdDate` as production date
+- If no MLC workflows found, uses `StoredModel.lastModifiedDate` as production date
 - If AuditRecord creation fails, logs error and continues with next model
 - If PATCH fails, logs error but doesn't retry previous records
 
@@ -509,7 +399,6 @@ For each production StoredModel:
 |------|---------|
 | `preflight.py` | Non-destructive GET-only validation script |
 | `backfill_storedModel_auditRecords.py` | Destructive POST/PATCH backfill script |
-| `.gitignore` | Protects `.env` and output CSVs from version control |
 | `requirements.txt` | Python package dependencies |
 | `.vscode/settings.json` | VS Code integrated terminal configuration |
 
@@ -538,7 +427,6 @@ Before executing backfill:
 - [ ] Preflight run successful with three CSV exports
 - [ ] Reviewed and approved preflight results
 - [ ] Network connectivity to ModelOp Center verified
-- [ ] Credentials are correct and stored in `.env`
 
 After backfill completion:
 
@@ -550,7 +438,5 @@ After backfill completion:
 
 ---
 
-**Last Updated**: February 24, 2026  
+**Last Updated**: March 12, 2026  
 **Version**: 1.0 — Production Ready  
-**Reference**: [Backfilling StoredModel AuditRecords Before ModelOp Center 3.4 Upgrade](https://modelop.atlassian.net/wiki/x/BIBbvQ)
-

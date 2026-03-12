@@ -3,9 +3,6 @@
 Backfill StoredModel AuditRecords in a ModelOp Center 3.4 Environment
 using modelMLC processInstance end times as historical production dates.
 
-This script implements the process described in:
-https://modelop.atlassian.net/wiki/spaces/ME/pages/3176890372/Backfilling+StoredModel+AuditRecords+Before+ModelOp+Center+3.4+Upgrade
-
 Key points:
 -----------
 * We assume you are ALREADY on ModelOp Center 3.4.
@@ -15,7 +12,7 @@ Key points:
 
 Script goals:
 -------------
-1) **Step 2 (from doc) — Identify existing StoredModels in production**
+1) Identify existing StoredModels in production
    - Use the dedicated endpoint:
        GET /api/storedModels/search/findProductionUseCases
      to list StoredModels (UseCases) that are in production.
@@ -26,15 +23,15 @@ Script goals:
    - Write: production_storedmodels_from_search.csv
    - Update: StoredModel stage and primary business driver with "unassigned"
 
-2) **Resolve desired production promotion date/time**
-   - For each StoredModel from Step 2:
+2) Resolve desired production promotion date/time
+   - For each StoredModel from Step 1:
        GET /api/modelMLCs/search/findAllByStoredModelIdAndGroupIn
      and use processInstance.endTime from the last relevant process
      instance as the historical production promotion date.
-   - If no such MLC is found, fall back to StoredModel.createdDate.
+   - If no such MLC is found, fall back to StoredModel.lastModifiedDate.
    - Write: mlc_resolved_production_dates.csv
 
-3) **Create and patch AuditRecords**
+3) Create and patch AuditRecords
    - For each entry:
        POST /model-manage/api/auditRecords
        PATCH /model-manage/api/auditRecords/{id}
@@ -62,15 +59,13 @@ from dotenv import load_dotenv
 # 1. CONFIGURATION & AUTHENTICATION
 # ==========================================
 
-load_dotenv(override=False)  # Load .env file; don't override existing environment variables
-
 # TODO: Add base url and access token
 # Retrieve configuration from environment or prompt user
 MOC_BASE_URL = "your-base-url".strip() 
 MOC_ACCESS_TOKEN = "your-access-token".strip()
 
 # TODO: Add production stage value
-# Production model stage value, from SCCS configuration (Step 1 in doc):
+# Production model stage value, from SCCS configuration in application.yaml:
 #   modelop:
 #     model-stages:
 #       production-stage: prod
@@ -82,8 +77,7 @@ PRODUCTION_MODEL_STAGE_VALUE = "Production"
 # Optional filter: which processDefinitionKeys represent promotion-to-prod workflows.
 #
 # If left empty, the script will:
-#   - consider ALL MLCs with non-null processInstance.endTime
-#   - pick the one with the LATEST endTime as the production promotion date.
+#   - fall back to using a use case's lastModifiedDate
 #
 # If you know your promotion workflow keys (e.g. "promote-to-prod"), specify them here.
 PRODUCTION_PROMOTION_PROCESS_DEFINITION_KEYS: List[str] = [
@@ -97,9 +91,10 @@ PRODUCTION_PROMOTION_PROCESS_DEFINITION_KEYS: List[str] = [
 # StoredModel discovery configuration
 # --------------------------------
 
-# We now explicitly use the Step 2 endpoint:
-#   GET /api/storedModels/search/findProductionUseCases
-#
+# We now explicitly use the following endpoints to find use cases in production and
+# to find all use cases.
+#   GET /api/storedModels/search/findProductionUseCases     # use cases in production
+#   GET /api/storedModels/
 # This endpoint returns StoredModels / UseCases that are in production.
 # We use this as the authoritative discovery mechanism.
 PRODUCTION_USECASE_SEARCH_PATH = "/model-manage/api/storedModels/search/findProductionUseCases"
@@ -118,18 +113,9 @@ ALL_STOREDMODEL_PATH = "/model-manage/api/storedModels"
 # MLC search endpoint configuration
 # --------------------------------
 
-# Endpoint you provided for finding MLC executions:
+# Endpoint for finding MLC executions:
 #   GET /api/modelMLCs/search/findAllByStoredModelIdAndGroupIn
 MODEL_MLC_SEARCH_PATH = "/model-manage/api/modelMLCs/search/findAllByStoredModelIdAndGroupIn"
-
-# Query parameter names for the MLC search endpoint.
-# These MAY vary per environment; confirm against your actual API docs.
-#
-# Default assumption:
-#   GET /api/modelMLCs/search/findAllByStoredModelIdAndGroupIn
-#       ?storedModelId=<UUID>&groups=<GROUP>&page=0&size=200
-MODEL_MLC_QUERY_PARAM_STORED_MODEL_ID = "storedModelId"  
-MODEL_MLC_QUERY_PARAM_GROUPS = "group"                  
 
 # --------------------------------
 # CSV OUTPUT LOCATIONS
@@ -152,7 +138,7 @@ AUDIT_BACKFILL_RESULTS_CSV = "auditrecord_backfill_results.csv"
 # HTTP / REQUESTS CONFIG
 # --------------------------------
 
-VERIFY_SSL = True      # TODO: set False ONLY if you must bypass TLS verification (not recommended)
+VERIFY_SSL = True      # set False ONLY if you must bypass TLS verification (not recommended)
 HTTP_TIMEOUT = 30      # seconds per request
 PAGE_SIZE = 200        # page size for list/search endpoints
 
@@ -169,96 +155,7 @@ logger = logging.getLogger("moc_3_4_audit_backfill")
 
 
 # ==========================================
-# 1.5 AUTHENTICATION & ENV FILE MANAGEMENT
-# ==========================================
-
-def authenticate_and_get_token(base_url: str, username: str, password: str) -> str:
-    """
-    Authenticate to ModelOp Center using username and password,
-    and retrieve an OAuth2 access token from the /gocli/token endpoint.
-
-    Parameters
-    ----------
-    base_url : str
-        Base URL of ModelOp Center (no trailing slash).
-    username : str
-        Username for authentication.
-    password : str
-        Password for authentication.
-
-    Returns
-    -------
-    str
-        OAuth2 access token.
-
-    Raises
-    ------
-    requests.RequestException
-        If authentication fails.
-    ValueError
-        If token extraction fails.
-    """
-    token_url = f"{base_url}/gocli/token"
-    payload = {"username": username, "password": password}
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
-    logger.info("Authenticating to ModelOp Center at %s...", base_url)
-    try:
-        response = requests.post(token_url, data=payload, headers=headers, timeout=HTTP_TIMEOUT, verify=VERIFY_SSL)
-        response.raise_for_status()
-        
-        access_token = response.text.strip()
-        logger.debug("Received token from authentication endpoint.")
-        
-        # Handle JSON response if applicable (some endpoints return raw string, others JSON)
-        if "{" in access_token:
-            try:
-                token_data = json.loads(access_token)
-                access_token = token_data.get("access_token", access_token)
-            except json.JSONDecodeError:
-                pass  # Use raw response if not valid JSON
-        
-        if not access_token:
-            raise ValueError("Could not extract access token from authentication response.")
-        
-        logger.info("Successfully authenticated to ModelOp Center.")
-        return access_token
-    except requests.RequestException as exc:
-        logger.error("Authentication failed: %s", exc)
-        raise
-
-
-def save_env_file(base_url: str, username: str, password: str, access_token: str, env_path: str = ".env") -> None:
-    """
-    Save configuration and access token to a .env file for future use.
-
-    Parameters
-    ----------
-    base_url : str
-        ModelOp Center base URL.
-    username : str
-        Username used for authentication.
-    password : str
-        Password used for authentication.
-    access_token : str
-        OAuth2 access token.
-    env_path : str, optional
-        Path to .env file, by default ".env".
-    """
-    try:
-        with open(env_path, "w") as env_file:
-            env_file.write(f"MOC_BASE_URL={base_url}\n")
-            env_file.write(f"USERNAME={username}\n")
-            env_file.write(f"PASSWORD={password}\n")
-            env_file.write(f"MOC_ACCESS_TOKEN={access_token}\n")
-        logger.info("Configuration saved to %s", env_path)
-    except IOError as exc:
-        logger.error("Failed to write .env file: %s", exc)
-        raise
-
-
-# ==========================================
-# 2. SHARED HELPERS
+#    AUTHENTICATION & ENV FILE MANAGEMENT
 # ==========================================
 
 def normalize_access_token(raw_token: str) -> str:
@@ -334,7 +231,7 @@ def create_authenticated_session(base_url: str, access_token: str) -> requests.S
 
 
 # ==========================================
-# 3. STEP 2 – IDENTIFY EXISTING STOREDMODELS IN PRODUCTION
+# 1. IDENTIFY EXISTING STOREDMODELS IN PRODUCTION
 #    VIA /api/storedModels/search/findProductionUseCases
 # ==========================================
 
@@ -367,7 +264,7 @@ def list_production_storedmodels_via_search(
         List of StoredModel JSON objects.
     """
     logger.info(
-        "Step 2 — Calling /api/storedModels/search/findProductionUseCases to discover production StoredModels..."
+        "Step 1 — Calling /api/storedModels/search/findProductionUseCases to discover production StoredModels..."
     )
     stored_models: List[Dict] = []
     page = 0
@@ -498,7 +395,7 @@ def discover_production_storedmodels(
     csv_path: str,
 ) -> List[Dict]:
     """
-    Step 2 implementation (plus persistence):
+    Step 1a implementation (plus persistence):
 
     1. If that endpoint is not available AND ENABLE_FALLBACK_STOREDMODEL_LISTING is True:
          - Call GET /model-manage/api/storedModels
@@ -554,7 +451,7 @@ def discover_production_storedmodels(
         stored_models = filter_production_stored_models(all_models, production_stage)
 
     if not stored_models:
-        logger.warning("No production StoredModels discovered in Step 2.")
+        logger.warning("No production StoredModels discovered in Step 1.")
         return []
 
     # add primary driver and model stage values
@@ -587,7 +484,7 @@ def discover_production_storedmodels(
     df = pd.DataFrame(rows)
     df.to_csv(csv_path, index=False)
     logger.info(
-        "Step 2 snapshot written: %d production StoredModels -> %s",
+        "Step 1 snapshot written: %d production StoredModels -> %s",
         len(df),
         csv_path,
     )
@@ -595,7 +492,7 @@ def discover_production_storedmodels(
 
 
 # ==========================================
-# 4. RESOLVE PRODUCTION DATES FROM MLC LOGS
+# 2. RESOLVE PRODUCTION DATES FROM MLC LOGS
 # ==========================================
 
 def fetch_model_mlcs_for_stored_model(
@@ -644,8 +541,8 @@ def fetch_model_mlcs_for_stored_model(
     while True:
         url = f"{base_url}{MODEL_MLC_SEARCH_PATH}"
         params = {
-            MODEL_MLC_QUERY_PARAM_STORED_MODEL_ID: stored_model_id,
-            MODEL_MLC_QUERY_PARAM_GROUPS: group,
+            "storedModelId": stored_model_id,
+            "group": group,
             "page": page,
             "size": page_size,
         }
@@ -801,7 +698,7 @@ def resolve_production_dates_from_mlcs(
     pd.DataFrame
         DataFrame of resolved production dates.
     """
-    logger.info("=== Step 3 — Resolving 'desired production promotion date/time' from modelMLC workflows ===")
+    logger.info("=== Step 2 — Resolving 'desired production promotion date/time' from modelMLC workflows ===")
 
     rows: List[Dict] = []
 
@@ -855,12 +752,12 @@ def resolve_production_dates_from_mlcs(
             proc_end = proc.get("endTime")
         else:
             logger.warning(
-                "No MLC endTime found for StoredModel %s. Falling back to StoredModel.createdDate=%s.",
+                "No MLC endTime found for StoredModel %s. Falling back to StoredModel.lastModifiedDate=%s.",
                 sm_id,
                 sm_created,
             )
-            resolved_date = sm_created
-            resolved_source = "STORED_MODEL_CREATED_DATE"
+            resolved_date = sm_last_modified
+            resolved_source = "STORED_MODEL_LAST_MODIFIED_DATE"
             mlc_id = None
             proc_id = None
             proc_def_key = None
@@ -904,7 +801,7 @@ def resolve_production_dates_from_mlcs(
 
 
 # ==========================================
-# 5. CREATE & PATCH AUDIT RECORDS (POST + PATCH)
+# 3. CREATE & PATCH AUDIT RECORDS (POST + PATCH)
 # ==========================================
 
 def post_audit_record(
@@ -917,11 +814,9 @@ def post_audit_record(
     """
     Create an AuditRecord for a StoredModel in the 3.4 environment.
 
-    Implements Step 4 in the Confluence guide:
-
         POST /model-manage/api/auditRecords
 
-    We follow the documented structure and set modelStage via 'changes'.
+    Set modelStage via 'changes'.
 
     Parameters
     ----------
@@ -984,8 +879,6 @@ def patch_audit_record_created_date(
     """
     PATCH an AuditRecord's createdDate to the resolved historical
     production promotion date.
-
-    This is Step 6 / Step 7 from the Confluence guide:
 
         PATCH /model-manage/api/auditRecords/{AUDIT_RECORD_ID}
         {
@@ -1083,7 +976,7 @@ def backfill_audit_records(
     pd.DataFrame
         DataFrame of backfill results.
     """
-    logger.info("=== Step 4 — Creating & PATCHing AuditRecords based on MLC production dates ===")
+    logger.info("=== Step 3 — Creating & PATCHing AuditRecords based on MLC production dates ===")
 
     try:
         df_source = pd.read_csv(source_csv_path)
@@ -1198,76 +1091,73 @@ def main() -> None:
 
     Summary of steps:
     -----------------
-    1) Authenticate to current 3.4 environment (MOC_BASE_URL + MOC_ACCESS_TOKEN).
-       - If token not in .env, authenticate with username/password and save to .env.
+    0) Authenticate to current 3.4 environment (MOC_BASE_URL + MOC_ACCESS_TOKEN).
 
-    2) **Step 2 — Identify existing StoredModels in production**
-       - Call GET /api/storedModels/search/findProductionUseCases
-       - Capture:
-           * StoredModel ID (UUID)
-           * Group (Business Unit)
-           * Name, modelStage, createdDate, lastModifiedDate
-       - Write: production_storedmodels_from_search.csv
+    1) Identify existing StoredModels in production
+        - Use the dedicated endpoint:
+            GET /api/storedModels/search/findProductionUseCases
+            to list StoredModels (UseCases) that are in production.
+        - Capture for each:
+            - StoredModel ID (UUID)
+            - Group (Business Unit)
+            - Name, modelStage, createdDate, lastModifiedDate
+        - Write: production_storedmodels_from_search.csv
+        - Update: StoredModel stage and primary business driver with "unassigned"
 
-    3) **Resolve desired production promotion date/time from MLC logs**
-       - For each StoredModel from step 2:
-           * GET /api/modelMLCs/search/findAllByStoredModelIdAndGroupIn
-           * Use processInstance.endTime from last relevant process as
-             the historical production timestamp.
-           * If no MLC is found, fall back to StoredModel.createdDate.
-       - Write: mlc_resolved_production_dates.csv
+    2) Resolve desired production promotion date/time
+        - For each StoredModel from Step 1:
+            GET /api/modelMLCs/search/findAllByStoredModelIdAndGroupIn
+            and use processInstance.endTime from the last relevant process
+            instance as the historical production promotion date.
+        - If no such MLC is found, fall back to StoredModel.lastModifiedDate.
+        - Write: mlc_resolved_production_dates.csv
 
-    4) **Create & PATCH AuditRecords**
-       - For each row in mlc_resolved_production_dates.csv:
-           * POST /model-manage/api/auditRecords
-           * PATCH /model-manage/api/auditRecords/{id} createdDate to 
-             resolvedProductionDate.
-       - Write: auditrecord_backfill_results.csv
+    3) Create and patch AuditRecords
+        - For each entry:
+            POST /model-manage/api/auditRecords
+            PATCH /model-manage/api/auditRecords/{id}
+            to set createdDate to the historical production date discovered
+            from MLCs.
+        - Write: auditrecord_backfill_results.csv1) Step 1 — Identify existing StoredModels in production
+            - Call GET /api/storedModels/search/findProductionUseCases
+            - Capture:
+                * StoredModel ID (UUID)
+                * Group (Business Unit)
+                * Name, modelStage, createdDate, lastModifiedDate
+            - Write: production_storedmodels_from_search.csv
 
     After completion:
     -----------------
     * All previously unmanaged production models will have AuditRecords
       with createdDate set to historical production dates derived from
-      the original MLC workflows.
+      the original MLC workflows, and all use case records will have
+      values for "modelStage" and "primaryDriver"
     * 3.4 dashboard components can then render accurate timelines and
       metrics for those models.
     """
     # Step 0: Handle authentication and .env file management
     global MOC_ACCESS_TOKEN  # Allow modification of the global variable
-    
-    if not MOC_ACCESS_TOKEN:
-        logger.info("No access token found in environment. Authenticating with username/password...")
-        try:
-            MOC_ACCESS_TOKEN = authenticate_and_get_token(MOC_BASE_URL, USERNAME, PASSWORD)
-            save_env_file(MOC_BASE_URL, USERNAME, PASSWORD, MOC_ACCESS_TOKEN)
-            logger.info("Token obtained and saved to .env file for future use.")
-        except Exception as exc:
-            logger.error("Failed to authenticate: %s", exc)
-            return
-    else:
-        logger.info("Access token loaded from environment. Proceeding with existing token.")
-    
-    # Step 1: Authenticate to MOC
+        
+    # Authenticate to MOC
     logger.info("Authenticating to ModelOp Center 3.4 environment: %s", MOC_BASE_URL)
     session = create_authenticated_session(MOC_BASE_URL, MOC_ACCESS_TOKEN)
 
-    # Step 2: Discover existing StoredModels in production
+    # Step 1: Discover existing StoredModels in production
     targets = discover_production_storedmodels(
         base_url=MOC_BASE_URL,
         session=session,
         production_stage=PRODUCTION_MODEL_STAGE_VALUE,
         csv_path=PRODUCTION_STOREDMODELS_CSV,
     )
-    #print("line 1278" + str(len(targets)))
-    #print(targets[0][0])
+
     if not targets:
         logger.error(
-            "No production StoredModels discovered via Step 2. "
+            "No production StoredModels discovered via Step 1. "
             "Aborting before resolving production dates or creating AuditRecords."
         )
         return
 
-    # Step 3: Resolve production dates from MLC logs
+    # Step 2: Resolve production dates from MLC logs
     df_mlc = resolve_production_dates_from_mlcs(
         base_url=MOC_BASE_URL,
         session=session,
@@ -1281,7 +1171,7 @@ def main() -> None:
         )
         return
 
-    # Step 4: Backfill AuditRecords (POST + PATCH)
+    # Step 3: Backfill AuditRecords (POST + PATCH)
     backfill_audit_records(
         base_url=MOC_BASE_URL,
         session=session,
